@@ -149,8 +149,7 @@ class PromptDataset(Dataset):
             return self.chosen_dataset[idx]["input_ids"], self.chosen_dataset[idx]["attention_mask"], \
                 self.reject_dataset[idx]["input_ids"], self.reject_dataset[idx]["attention_mask"]
         elif self.train_phase == 3:
-            return self.prompt_dataset[idx]["input_ids"],self.prompt_dataset[idx]["attention_mask"], \
-                self.pad_token_id
+            return self.prompt_dataset[idx]["input_ids"],self.prompt_dataset[idx]["attention_mask"], self.prompt_dataset[idx]["label"], self.prompt_dataset[idx]["label_input_ids"], self.prompt_dataset[idx]["label_attention_mask"], self.pad_token_id
 
 
 def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
@@ -208,10 +207,30 @@ def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
         for i, tmp_data in enumerate(current_dataset):
             # tokenize the text
             prompt = raw_dataset.get_prompt(tmp_data)
+            chosen_sentence = raw_dataset.get_prompt_and_chosen(
+                tmp_data)  
             if prompt is not None:
                 prompt_token = tokenizer(prompt, return_tensors="pt")
                 prompt_token["input_ids"] = prompt_token["input_ids"]
                 prompt_token["attention_mask"] = prompt_token["attention_mask"]
+                prompt_token["label"] = chosen_sentence
+
+                chosen_sentence += end_of_conversation_token
+                chosen_token = tokenizer(chosen_sentence,
+                                         max_length=max_seq_len,
+                                         padding="max_length",
+                                         truncation=True,
+                                         return_tensors="pt")
+                chosen_token["input_ids"] = chosen_token["input_ids"].squeeze(
+                    0)
+                chosen_token["attention_mask"] = chosen_token[
+                    "attention_mask"].squeeze(0)
+
+                chosen_token = tokenizer(chosen_sentence, return_tensors="pt")
+                prompt_token["label_input_ids"] = chosen_token["input_ids"]
+                prompt_token["label_attention_mask"] = chosen_token["attention_mask"]
+
+
                 for key_word in ["input_ids", "attention_mask"]:
                     length = prompt_token[key_word].size()[-1]
                     if length > max_seq_len:
@@ -265,7 +284,7 @@ def create_prompt_dataset(local_rank,
                           max_seq_len,
                           end_of_conversation_token="<|endoftext|>",
                           sft_only_data_path=[],
-                          reload=False):
+                          reload=True):
     """
     Creates the prompt dataset
     """
@@ -283,7 +302,6 @@ def create_prompt_dataset(local_rank,
     cache_found = os.path.isfile(train_fname) and os.path.isfile(eval_fname)
     buf_create_cache = torch.ByteTensor([not cache_found]).cuda()
     torch.distributed.all_reduce(buf_create_cache)
-
     if local_rank <= 0 and (buf_create_cache.item() != 0 or reload):
         if len(data_path) == 1:  # Single dataset.
             train_dataset, eval_dataset = create_dataset(
@@ -377,6 +395,15 @@ class DataCollatorRLHF:
         prompt_mask = pad_sequence([f[1] for f in data],
                                    padding_value=0,
                                    batch_first=True)
+        chosen = [f[2] for f in data]
+#        print("test----------------")
+#        print([f[3] for f in data])
+        chosen_token = pad_sequence([f[3].T for f in data],
+                              padding_value=pad_token_id,
+                              batch_first=True).squeeze()
+        chosen_mask = pad_sequence([f[4].T for f in data],
+                                   padding_value=0,
+                                   batch_first=True).squeeze()
 
         ### make sure the final ouput is a seqence of 2**?
         length = prompt.size()[-1]
@@ -390,11 +417,47 @@ class DataCollatorRLHF:
                                              pad=(0, pad_length),
                                              mode='constant',
                                              value=0)
+
+        ### make sure the final ouput is a seqence of 2**?
+#        length = chosen_token.size()[-1]
+#        pad_length = self.max_token_len - length
+#        if pad_length > 0:
+#            chosen_token = F.pad(chosen_token,
+#                                    pad=(0, pad_length),
+#                                    mode='constant',
+#                                    value=pad_token_id)
+#            chosen_mask = F.pad(chosen_mask,
+#                                             pad=(0, pad_length),
+#                                             mode='constant',
+#                                             value=0)
+
+
+                                    
+#            batch["chosen"] = F.pad(chosen_token,
+#                                    pad=(0, pad_length),
+#                                    mode='constant',
+#                                    value=pad_token_id)
+#            batch["chosen_att_mask"] = F.pad(chosen_mask,
+#                                             pad=(0, pad_length),
+#                                             mode='constant',
+#                                             value=0)
+        
         else:
             batch["prompt"] = prompt
             batch["prompt_att_mask"] = prompt_mask
+
+        batch["chosen"] = chosen_token
+        batch["chosen_att_mask"] = chosen_mask
+
+
         batch["prompt"] = batch["prompt"].flip(1)
         batch["prompt_att_mask"] = batch["prompt_att_mask"].flip(1)
+        batch["label"] = chosen
+
+        batch["chosen"] = batch["chosen"]
+        batch["chosen_att_mask"] = batch["chosen_att_mask"]
+
+
         return batch
 
 
